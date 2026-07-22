@@ -134,6 +134,22 @@ def send_telegram_message(text: str):
             print(f"[send_telegram_message] gagal kirim chunk: {e}")
 
 
+def send_telegram_document(text: str, filename: str, caption: str = ""):
+    """Kirim teks sebagai file .txt — dipakai untuk fallback saat semua model Gemini gagal,
+    biar user tinggal download & copy-paste manual ke ChatGPT/tool lain."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+    try:
+        resp = requests.post(
+            url,
+            data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+            files={"document": (filename, text.encode("utf-8"), "text/plain")},
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[send_telegram_document] gagal: {e}")
+
+
 # ── Topic filter & reply helpers ─────────────────────────────────────────
 def is_in_target_topic(msg) -> bool:
     """
@@ -242,13 +258,31 @@ async def run_ingest():
 
     # 2. Susun pesan final
     final_message = "📊 *Ringkasan Grup Saham Hari Ini*\n\n"
-    final_message += summary or "_Tidak ada pesan baru sejak run terakhir._"
+
+    if summary:
+        final_message += summary
+    elif texts_for_summary:
+        final_message += (
+            "_Gagal generate ringkasan otomatis (semua model Gemini gagal). "
+            "Teks mentah obrolan dikirim sebagai file di bawah — bisa di-copy manual ke ChatGPT._"
+        )
+    else:
+        final_message += "_Tidak ada pesan baru sejak run terakhir._"
 
     if highlight_messages:
         final_message += "\n\n⭐ *Pesan dari User Tertentu (Highlight)*\n\n"
         final_message += "\n\n".join(reversed(highlight_messages))
 
     send_telegram_message(final_message)
+
+    if not summary and texts_for_summary:
+        today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+        send_telegram_document(
+            payload_text,
+            filename=f"obrolan-mentah-{today_str}.txt",
+            caption="Teks mentah obrolan hari ini (fallback karena ringkasan Gemini gagal).",
+        )
+
     set_last_run_timestamp(int(time.time()))
 
     print(f"Selesai. {len(all_texts)} pesan diproses, {len(highlight_messages)} highlight ditemukan.")
