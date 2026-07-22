@@ -70,22 +70,15 @@ def set_last_run_timestamp(ts: int):
 
 # ── Gemini summarization ─────────────────────────────────────────────────
 MAX_MESSAGES_FOR_SUMMARY = 150  # pengaman: batasi payload biar tidak terlalu besar
+GEMINI_MODELS = ["gemini-3.5-flash", "gemini-2.5-flash"]  # fallback berurutan kalau model pertama gagal
 
 
-def summarize_conversation(all_messages_text: str) -> str | None:
-    prompt = (
-        "Berikut kumpulan pesan dari grup diskusi saham hari ini. "
-        "Buat ringkasan singkat (maks 5-7 poin bullet) dalam bahasa Indonesia, "
-        "mencakup: topik/saham yang dibahas, sentimen umum, dan hal penting yang disebut.\n\n"
-        f"{all_messages_text}"
-    )
-
-    max_retries = 3
+def _call_gemini(model: str, prompt: str) -> str | None:
+    max_retries = 2
     for attempt in range(1, max_retries + 1):
         try:
             response = requests.post(
-                "https://generativelanguage.googleapis.com/v1beta/models/"
-                f"gemini-3.5-flash:generateContent?key={GEMINI_API_KEY}",
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}",
                 headers={"Content-Type": "application/json"},
                 json={"contents": [{"parts": [{"text": prompt}]}]},
                 timeout=60,
@@ -97,14 +90,28 @@ def summarize_conversation(all_messages_text: str) -> str | None:
             status = e.response.status_code if e.response is not None else None
             if status == 503 and attempt < max_retries:
                 wait = 5 * attempt
-                print(f"[summarize_conversation] 503, retry {attempt}/{max_retries} setelah {wait}s...")
+                print(f"[_call_gemini:{model}] 503, retry {attempt}/{max_retries} setelah {wait}s...")
                 time.sleep(wait)
                 continue
-            print(f"[summarize_conversation] gagal: {e}")
+            print(f"[_call_gemini:{model}] gagal: {e}")
             return None
         except Exception as e:
-            print(f"[summarize_conversation] gagal: {e}")
+            print(f"[_call_gemini:{model}] gagal: {e}")
             return None
+    return None
+
+
+def summarize_conversation(all_messages_text: str) -> str | None:
+    prompt = (
+        "Berikut kumpulan pesan dari grup diskusi saham hari ini. "
+        "Buat ringkasan singkat (maks 5-7 poin bullet) dalam bahasa Indonesia, "
+        "mencakup: topik/saham yang dibahas, sentimen umum, dan hal penting yang disebut.\n\n"
+        f"{all_messages_text}"
+    )
+    for model in GEMINI_MODELS:
+        result = _call_gemini(model, prompt)
+        if result:
+            return result
     return None
 
 
