@@ -1,0 +1,3 @@
+telethon
+firebase-admin
+requests
