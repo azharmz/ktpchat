@@ -70,7 +70,7 @@ def set_last_run_timestamp(ts: int):
 
 # ── Gemini summarization ─────────────────────────────────────────────────
 MAX_MESSAGES_FOR_SUMMARY = 150  # pengaman: batasi payload biar tidak terlalu besar
-GEMINI_MODELS = ["gemini-3.5-flash", "gemini-2.5-flash"]  # fallback berurutan kalau model pertama gagal
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash-001", "gemini-flash-latest"]  # fallback berurutan
 
 
 def _call_gemini(model: str, prompt: str) -> str | None:
@@ -231,7 +231,14 @@ async def run_ingest():
     # 1. Ringkasan keseluruhan obrolan (batasi ke N pesan terbaru biar payload tidak kebesaran)
     # all_texts urut dari terbaru->terlama (sesuai urutan iter_messages), jadi ambil dari depan
     texts_for_summary = all_texts[:MAX_MESSAGES_FOR_SUMMARY] if all_texts else []
-    summary = summarize_conversation("\n".join(reversed(texts_for_summary))) if texts_for_summary else None
+    payload_text = "\n".join(reversed(texts_for_summary))
+
+    print(f"[debug] jumlah pesan dikirim ke Gemini = {len(texts_for_summary)}")
+    print(f"[debug] panjang teks payload = {len(payload_text)} karakter")
+    print(f"[debug] preview payload (300 karakter pertama):\n{payload_text[:300]}")
+    print(f"[debug] preview payload (300 karakter terakhir):\n{payload_text[-300:]}")
+
+    summary = summarize_conversation(payload_text) if texts_for_summary else None
 
     # 2. Susun pesan final
     final_message = "📊 *Ringkasan Grup Saham Hari Ini*\n\n"
