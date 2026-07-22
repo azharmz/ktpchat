@@ -45,7 +45,9 @@ STATE_DOC = db.collection("ingestState").document("telegramStockGroup")
 
 # ── Firestore helpers ────────────────────────────────────────────────────
 def get_highlight_user_ids() -> set[int]:
-    docs = db.collection("highlightUsers").where("active", "==", True).stream()
+    from google.cloud.firestore_v1.base_query import FieldFilter
+
+    docs = db.collection("highlightUsers").where(filter=FieldFilter("active", "==", True)).stream()
     return {doc.to_dict()["telegramUserId"] for doc in docs}
 
 
@@ -111,8 +113,16 @@ def send_telegram_message(text: str):
 
 # ── Topic filter ──────────────────────────────────────────────────────────
 def is_in_target_topic(msg) -> bool:
+    """
+    Topic "General" (topic_id=1) itu kasus khusus: pesan yang diposting
+    langsung ke General biasanya TIDAK punya msg.reply_to sama sekali
+    (beda dari topic lain yang selalu ada reply_to_top_id).
+    Jadi kalau target topic-nya General, anggap match kalau reply_to kosong
+    ATAU top_id-nya memang 1.
+    """
     if not msg.reply_to:
-        return False
+        return TG_TOPIC_ID == 1
+
     top_id = getattr(msg.reply_to, "reply_to_top_id", None) or msg.reply_to.reply_to_msg_id
     return top_id == TG_TOPIC_ID
 
@@ -125,14 +135,21 @@ async def run_ingest():
     last_run = get_last_run_timestamp()
     highlight_ids = get_highlight_user_ids()
 
+    print(f"[debug] last_run timestamp = {last_run} ({datetime.datetime.utcfromtimestamp(last_run)} UTC)")
+    print(f"[debug] highlight_ids = {highlight_ids}")
+
     all_texts = []
     highlight_messages = []
+    raw_count = 0
+    topic_match_count = 0
 
     async for msg in client.iter_messages(TG_GROUP_ID, limit=1000):
+        raw_count += 1
         if msg.date.timestamp() < last_run:
             break  # pesan sudah lama, stop (Telethon urut dari terbaru ke lama)
         if not is_in_target_topic(msg):
             continue
+        topic_match_count += 1
         if not msg.text:
             continue
 
@@ -141,6 +158,9 @@ async def run_ingest():
 
         if msg.sender_id in highlight_ids:
             highlight_messages.append(f"*{sender_name}*: {msg.text}")
+
+    print(f"[debug] pesan mentah dicek (sebelum stop by date) = {raw_count}")
+    print(f"[debug] pesan yang match topic filter = {topic_match_count}")
 
     await client.disconnect()
 
