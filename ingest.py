@@ -69,6 +69,9 @@ def set_last_run_timestamp(ts: int):
 
 
 # ── Gemini summarization ─────────────────────────────────────────────────
+MAX_MESSAGES_FOR_SUMMARY = 150  # pengaman: batasi payload biar tidak terlalu besar
+
+
 def summarize_conversation(all_messages_text: str) -> str | None:
     prompt = (
         "Berikut kumpulan pesan dari grup diskusi saham hari ini. "
@@ -76,20 +79,33 @@ def summarize_conversation(all_messages_text: str) -> str | None:
         "mencakup: topik/saham yang dibahas, sentimen umum, dan hal penting yang disebut.\n\n"
         f"{all_messages_text}"
     )
-    try:
-        response = requests.post(
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-3.5-flash:generateContent?key={GEMINI_API_KEY}",
-            headers={"Content-Type": "application/json"},
-            json={"contents": [{"parts": [{"text": prompt}]}]},
-            timeout=60,
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception as e:
-        print(f"[summarize_conversation] gagal: {e}")
-        return None
+
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.post(
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"gemini-3.5-flash:generateContent?key={GEMINI_API_KEY}",
+                headers={"Content-Type": "application/json"},
+                json={"contents": [{"parts": [{"text": prompt}]}]},
+                timeout=60,
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status == 503 and attempt < max_retries:
+                wait = 5 * attempt
+                print(f"[summarize_conversation] 503, retry {attempt}/{max_retries} setelah {wait}s...")
+                time.sleep(wait)
+                continue
+            print(f"[summarize_conversation] gagal: {e}")
+            return None
+        except Exception as e:
+            print(f"[summarize_conversation] gagal: {e}")
+            return None
+    return None
 
 
 # ── Telegram delivery ─────────────────────────────────────────────────────
@@ -111,7 +127,7 @@ def send_telegram_message(text: str):
             print(f"[send_telegram_message] gagal kirim chunk: {e}")
 
 
-# ── Topic filter ──────────────────────────────────────────────────────────
+# ── Topic filter & reply helpers ─────────────────────────────────────────
 def is_in_target_topic(msg) -> bool:
     """
     Topic "General" (topic_id=1) itu kasus khusus: pesan yang diposting
@@ -127,6 +143,21 @@ def is_in_target_topic(msg) -> bool:
     return top_id == TG_TOPIC_ID
 
 
+def get_genuine_reply_id(msg):
+    """
+    Bedakan antara reply_to yang cuma penanda topic thread (reply_to_top_id)
+    dengan reply beneran ke pesan spesifik (reply_to_msg_id berbeda dari top_id).
+    Return message id yang di-reply kalau ini reply beneran, None kalau bukan.
+    """
+    if not msg.reply_to:
+        return None
+    reply_msg_id = getattr(msg.reply_to, "reply_to_msg_id", None)
+    top_id = getattr(msg.reply_to, "reply_to_top_id", None) or reply_msg_id
+    if reply_msg_id and reply_msg_id != top_id:
+        return reply_msg_id
+    return None
+
+
 # ── Main ingest logic ─────────────────────────────────────────────────────
 async def run_ingest():
     client = TelegramClient(StringSession(TG_SESSION_STRING), TG_API_ID, TG_API_HASH)
@@ -139,7 +170,8 @@ async def run_ingest():
     print(f"[debug] highlight_ids = {highlight_ids}")
 
     all_texts = []
-    highlight_messages = []
+    highlight_entries = []  # list of (sender_name, text, reply_id)
+    msg_cache = {}  # msg.id -> (sender_name, text), untuk resolve reply tanpa API call ekstra
     raw_count = 0
     topic_match_count = 0
 
@@ -154,18 +186,45 @@ async def run_ingest():
             continue
 
         sender_name = getattr(msg.sender, "first_name", "Unknown") if msg.sender else "Unknown"
+        msg_cache[msg.id] = (sender_name, msg.text)
         all_texts.append(f"{sender_name}: {msg.text}")
 
         if msg.sender_id in highlight_ids:
-            highlight_messages.append(f"*{sender_name}*: {msg.text}")
+            reply_id = get_genuine_reply_id(msg)
+            highlight_entries.append((sender_name, msg.text, reply_id))
 
     print(f"[debug] pesan mentah dicek (sebelum stop by date) = {raw_count}")
     print(f"[debug] pesan yang match topic filter = {topic_match_count}")
 
+    # Resolve konteks reply untuk highlight (pakai cache dulu, fallback fetch kalau tidak ada)
+    highlight_messages = []
+    for sender_name, text, reply_id in highlight_entries:
+        context_line = ""
+        if reply_id:
+            if reply_id in msg_cache:
+                reply_sender, reply_text = msg_cache[reply_id]
+            else:
+                try:
+                    reply_msg = await client.get_messages(TG_GROUP_ID, ids=reply_id)
+                    reply_sender = (
+                        getattr(reply_msg.sender, "first_name", "Unknown") if reply_msg and reply_msg.sender else "Unknown"
+                    )
+                    reply_text = reply_msg.text if reply_msg and reply_msg.text else "(pesan tanpa teks/media)"
+                except Exception:
+                    reply_sender, reply_text = None, None
+
+            if reply_text:
+                snippet = reply_text if len(reply_text) <= 150 else reply_text[:150] + "..."
+                context_line = f"↪️ _membalas {reply_sender}: \"{snippet}\"_\n"
+
+        highlight_messages.append(f"{context_line}*{sender_name}*: {text}")
+
     await client.disconnect()
 
-    # 1. Ringkasan keseluruhan obrolan
-    summary = summarize_conversation("\n".join(reversed(all_texts))) if all_texts else None
+    # 1. Ringkasan keseluruhan obrolan (batasi ke N pesan terbaru biar payload tidak kebesaran)
+    # all_texts urut dari terbaru->terlama (sesuai urutan iter_messages), jadi ambil dari depan
+    texts_for_summary = all_texts[:MAX_MESSAGES_FOR_SUMMARY] if all_texts else []
+    summary = summarize_conversation("\n".join(reversed(texts_for_summary))) if texts_for_summary else None
 
     # 2. Susun pesan final
     final_message = "📊 *Ringkasan Grup Saham Hari Ini*\n\n"
