@@ -52,8 +52,12 @@ def get_highlight_user_ids() -> set[int]:
 
 
 def _start_of_today_timestamp() -> int:
-    now = datetime.datetime.utcnow()
-    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    """
+    Awal hari dihitung berdasarkan WIB (UTC+7) — setara 01:00 WITA.
+    """
+    wib = datetime.timezone(datetime.timedelta(hours=7))
+    now_wib = datetime.datetime.now(wib)
+    start_of_day = now_wib.replace(hour=0, minute=0, second=0, microsecond=0)
     return int(start_of_day.timestamp())
 
 
@@ -189,7 +193,12 @@ async def run_ingest():
     last_run = get_last_run_timestamp()
     highlight_ids = get_highlight_user_ids()
 
-    print(f"[debug] last_run timestamp = {last_run} ({datetime.datetime.utcfromtimestamp(last_run)} UTC)")
+    wita = datetime.timezone(datetime.timedelta(hours=8))
+    print(
+        f"[debug] last_run timestamp = {last_run} "
+        f"({datetime.datetime.fromtimestamp(last_run, datetime.timezone.utc)} UTC / "
+        f"{datetime.datetime.fromtimestamp(last_run, wita)} WITA)"
+    )
     print(f"[debug] highlight_ids = {highlight_ids}")
 
     all_texts = []
