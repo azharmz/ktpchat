@@ -73,8 +73,8 @@ def set_last_run_timestamp(ts: int):
 
 
 # ── Gemini summarization ─────────────────────────────────────────────────
-MAX_MESSAGES_FOR_SUMMARY = 150  # pengaman: batasi payload biar tidak terlalu besar
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash-001", "gemini-flash-latest"]  # fallback berurutan
+MAX_MESSAGES_FOR_SUMMARY = 300  # dinaikkan dari 150 — grup sangat aktif (~1000 pesan/hari), beri buffer lebih besar
+GEMINI_MODELS = ["gemini-2.0-flash-001", "gemini-flash-latest", "gemini-2.5-flash-lite"]  # fallback berurutan
 
 
 def _call_gemini(model: str, prompt: str) -> str | None:
@@ -129,7 +129,10 @@ def send_telegram_message(text: str):
                 json={
                     "chat_id": TELEGRAM_CHAT_ID,
                     "text": chunk,
-                    "parse_mode": "Markdown",
+                    # parse_mode SENGAJA tidak dipakai (plain text) — teks highlight berisi
+                    # konten mentah dari user (bisa ada _ atau * yang bukan markup),
+                    # kalau pakai parse_mode=Markdown itu bikin Telegram nolak seluruh
+                    # pesan dengan 400 Bad Request kalau markup-nya tidak seimbang.
                 },
                 timeout=15,
             )
@@ -207,7 +210,7 @@ async def run_ingest():
     raw_count = 0
     topic_match_count = 0
 
-    async for msg in client.iter_messages(TG_GROUP_ID, limit=1000):
+    async for msg in client.iter_messages(TG_GROUP_ID, limit=3000):
         raw_count += 1
         if msg.date.timestamp() < last_run:
             break  # pesan sudah lama, stop (Telethon urut dari terbaru ke lama)
@@ -247,15 +250,20 @@ async def run_ingest():
 
             if reply_text:
                 snippet = reply_text if len(reply_text) <= 150 else reply_text[:150] + "..."
-                context_line = f"↪️ _membalas {reply_sender}: \"{snippet}\"_\n"
+                context_line = f"↪️ membalas {reply_sender}: \"{snippet}\"\n"
 
-        highlight_messages.append(f"{context_line}*{sender_name}*: {text}")
+        highlight_messages.append(f"{context_line}{sender_name}: {text}")
 
     await client.disconnect()
 
     # 1. Ringkasan keseluruhan obrolan (batasi ke N pesan terbaru biar payload tidak kebesaran)
     # all_texts urut dari terbaru->terlama (sesuai urutan iter_messages), jadi ambil dari depan
     texts_for_summary = all_texts[:MAX_MESSAGES_FOR_SUMMARY] if all_texts else []
+    if len(all_texts) > MAX_MESSAGES_FOR_SUMMARY:
+        print(
+            f"[debug] PERINGATAN: {len(all_texts)} pesan ditemukan, dipotong ke "
+            f"{MAX_MESSAGES_FOR_SUMMARY} pesan terbaru untuk ringkasan (sisanya tidak diringkas)."
+        )
     payload_text = "\n".join(reversed(texts_for_summary))
 
     print(f"[debug] jumlah pesan dikirim ke Gemini = {len(texts_for_summary)}")
@@ -266,20 +274,20 @@ async def run_ingest():
     summary = summarize_conversation(payload_text) if texts_for_summary else None
 
     # 2. Susun pesan final
-    final_message = "📊 *Ringkasan Grup Saham Hari Ini*\n\n"
+    final_message = "📊 Ringkasan Obrolan Grup Saham (beberapa jam terakhir)\n\n"
 
     if summary:
         final_message += summary
     elif texts_for_summary:
         final_message += (
-            "_Gagal generate ringkasan otomatis (semua model Gemini gagal). "
-            "Teks mentah obrolan dikirim sebagai file di bawah — bisa di-copy manual ke ChatGPT._"
+            "Gagal generate ringkasan otomatis (semua model Gemini gagal). "
+            "Teks mentah obrolan dikirim sebagai file di bawah — bisa di-copy manual ke ChatGPT."
         )
     else:
-        final_message += "_Tidak ada pesan baru sejak run terakhir._"
+        final_message += "Tidak ada pesan baru sejak run terakhir."
 
     if highlight_messages:
-        final_message += "\n\n⭐ *Pesan dari User Tertentu (Highlight)*\n\n"
+        final_message += "\n\n⭐ Pesan dari User Tertentu (Highlight)\n\n"
         final_message += "\n\n".join(reversed(highlight_messages))
 
     send_telegram_message(final_message)

@@ -2,8 +2,8 @@ name: tg-highlight
 
 on:
   schedule:
-    # 23:00 UTC = 07:00 WITA (UTC+8) keesokan harinya
-    - cron: '0 23 * * *'
+    # Tiap 2 jam (12x/hari) — jauh di bawah limit free tier Gemini (min. 250 request/hari)
+    - cron: '0 */2 * * *'
   workflow_dispatch: {}  # bisa trigger manual dari tab Actions untuk testing
 
 jobs:
