@@ -13,6 +13,7 @@ Alur:
 import os
 import json
 import time
+import base64
 import asyncio
 import datetime
 
@@ -27,7 +28,8 @@ TG_API_ID = int(os.environ["TG_API_ID"])
 TG_API_HASH = os.environ["TG_API_HASH"]
 TG_SESSION_STRING = os.environ["TG_SESSION_STRING"]
 TG_GROUP_ID = int(os.environ["TG_GROUP_ID"])
-TG_TOPIC_ID = int(os.environ["TG_TOPIC_ID"])
+# Bisa isi lebih dari 1 topic, dipisah koma, contoh: "1,3"
+TG_TOPIC_IDS = {int(x.strip()) for x in os.environ["TG_TOPIC_ID"].split(",")}
 
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -119,6 +121,46 @@ def summarize_conversation(all_messages_text: str) -> str | None:
     return None
 
 
+def analyze_chart_image(image_bytes: bytes, caption: str) -> str | None:
+    """
+    Analisis gambar chart saham via Gemini Vision. Dipakai khusus untuk pesan
+    highlight yang berupa foto (misal watchlist dari mentor di topic mentor).
+    """
+    prompt = (
+        "Ini adalah gambar chart saham yang dikirim mentor ke grup diskusi saham. "
+        f"Caption yang menyertai: \"{caption or '(tidak ada caption)'}\"\n\n"
+        "Jelaskan singkat dalam bahasa Indonesia (2-4 kalimat): saham/ticker apa yang dimaksud "
+        "(kalau terlihat di gambar atau caption), level harga penting yang terlihat (support/resistance/target), "
+        "dan pola candlestick/tren yang tampak. Kalau ada elemen yang tidak jelas, sebutkan saja apa yang terlihat."
+    )
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    for model in GEMINI_MODELS:
+        try:
+            response = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "contents": [
+                        {
+                            "parts": [
+                                {"text": prompt},
+                                {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}},
+                            ]
+                        }
+                    ]
+                },
+                timeout=60,
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except Exception as e:
+            print(f"[analyze_chart_image:{model}] gagal: {e}")
+            continue
+    return None
+
+
 # ── Telegram delivery ─────────────────────────────────────────────────────
 def send_telegram_message(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -163,14 +205,14 @@ def is_in_target_topic(msg) -> bool:
     Topic "General" (topic_id=1) itu kasus khusus: pesan yang diposting
     langsung ke General biasanya TIDAK punya msg.reply_to sama sekali
     (beda dari topic lain yang selalu ada reply_to_top_id).
-    Jadi kalau target topic-nya General, anggap match kalau reply_to kosong
-    ATAU top_id-nya memang 1.
+    Jadi kalau salah satu target topic-nya General, anggap match kalau
+    reply_to kosong ATAU top_id-nya ada di TG_TOPIC_IDS.
     """
     if not msg.reply_to:
-        return TG_TOPIC_ID == 1
+        return 1 in TG_TOPIC_IDS
 
     top_id = getattr(msg.reply_to, "reply_to_top_id", None) or msg.reply_to.reply_to_msg_id
-    return top_id == TG_TOPIC_ID
+    return top_id in TG_TOPIC_IDS
 
 
 def get_genuine_reply_id(msg):
@@ -203,6 +245,7 @@ async def run_ingest():
         f"{datetime.datetime.fromtimestamp(last_run, wita)} WITA)"
     )
     print(f"[debug] highlight_ids = {highlight_ids}")
+    print(f"[debug] TG_TOPIC_IDS = {TG_TOPIC_IDS}")
 
     all_texts = []
     highlight_entries = []  # list of (sender_name, text, reply_id)
@@ -217,23 +260,31 @@ async def run_ingest():
         if not is_in_target_topic(msg):
             continue
         topic_match_count += 1
-        if not msg.text:
+
+        is_highlight_sender = msg.sender_id in highlight_ids
+        has_photo = bool(msg.photo)
+
+        # Pesan biasa tanpa teks & tanpa foto: skip. Tapi foto dari highlight user
+        # tetap diproses meski caption kosong (misal watchlist chart tanpa caption).
+        if not msg.text and not (is_highlight_sender and has_photo):
             continue
 
         sender_name = getattr(msg.sender, "first_name", "Unknown") if msg.sender else "Unknown"
-        msg_cache[msg.id] = (sender_name, msg.text)
-        all_texts.append(f"{sender_name}: {msg.text}")
 
-        if msg.sender_id in highlight_ids:
+        if msg.text:
+            msg_cache[msg.id] = (sender_name, msg.text)
+            all_texts.append(f"{sender_name}: {msg.text}")
+
+        if is_highlight_sender:
             reply_id = get_genuine_reply_id(msg)
-            highlight_entries.append((sender_name, msg.text, reply_id))
+            highlight_entries.append((sender_name, msg.text or "", reply_id, msg if has_photo else None))
 
     print(f"[debug] pesan mentah dicek (sebelum stop by date) = {raw_count}")
     print(f"[debug] pesan yang match topic filter = {topic_match_count}")
 
-    # Resolve konteks reply untuk highlight (pakai cache dulu, fallback fetch kalau tidak ada)
+    # Resolve konteks reply + analisis gambar untuk highlight (pakai cache dulu, fallback fetch kalau tidak ada)
     highlight_messages = []
-    for sender_name, text, reply_id in highlight_entries:
+    for sender_name, text, reply_id, photo_msg in highlight_entries:
         context_line = ""
         if reply_id:
             if reply_id in msg_cache:
@@ -252,7 +303,21 @@ async def run_ingest():
                 snippet = reply_text if len(reply_text) <= 150 else reply_text[:150] + "..."
                 context_line = f"↪️ membalas {reply_sender}: \"{snippet}\"\n"
 
-        highlight_messages.append(f"{context_line}{sender_name}: {text}")
+        image_analysis_line = ""
+        if photo_msg is not None:
+            try:
+                image_bytes = await client.download_media(photo_msg, file=bytes)
+                analysis = analyze_chart_image(image_bytes, text)
+                if analysis:
+                    image_analysis_line = f"🖼️ [Analisis chart] {analysis}\n"
+                else:
+                    image_analysis_line = "🖼️ [Ada gambar chart, tapi gagal dianalisis otomatis]\n"
+            except Exception as e:
+                print(f"[image_analysis] gagal download/analisis: {e}")
+                image_analysis_line = "🖼️ [Ada gambar chart, tapi gagal diproses]\n"
+
+        text_line = f"{sender_name}: {text}" if text else f"{sender_name}: (foto tanpa caption)"
+        highlight_messages.append(f"{context_line}{text_line}\n{image_analysis_line}".rstrip())
 
     await client.disconnect()
 
